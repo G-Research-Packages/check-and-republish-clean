@@ -11,12 +11,16 @@ inputs:
     description: 'A GitHub auth token which has access to read workflow information, including logs and artifacts, from the source owner and repo(s).'
     required: true
   package-push-user:
-    description: 'A GitHub user which has access to list and upload packages to the repo where this action is running.'
+    description: '(obsolete) A GitHub user which has access to list and upload packages to the repo where this action is running.'
     required: false
     default:  'svc-gh-packagemanager'
   package-push-token:
-    description: 'A GitHub auth token which has access to list and upload packages to the repo where this action is running.'
+    description: 'A GitHub auth token which has access to list and upload packages and releases to the repo where this action is running.'
     required: true
+  publish-as-release:
+    description: 'If true, publish build artifact as a Release in the repo where this action is running, rather than as a Package on the Org. Name your release artifact <name of release>_<releasetag>.tar.gz (only .tar.gz is supported)'
+    required: false
+
 runs:
   using: 'node12'
   main: 'index.js'
