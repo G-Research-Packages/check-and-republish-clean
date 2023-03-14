@@ -4,6 +4,7 @@ const {graphql} = require('@octokit/graphql');
 const fetch = require('node-fetch');
 const fs = require('fs');
 const fsp = require('fs').promises;
+const { Octokit } = require("@octokit/rest");
 const util = require('util');
 const exec = util.promisify(require('child_process').exec);
 const streamPipeline = util.promisify(require('stream').pipeline);
@@ -60,31 +61,18 @@ async function getExistingReleases(thisOwner, thisRepo, packagePushToken) {
 }
  
 async function getExistingPackages(thisOwner, thisRepo, packagePushToken) {
-    const packagesQuery = `
-    {
-     repository(owner: "${thisOwner}", name: "${thisRepo}") {
-        packages(first: 100) {
-          nodes {
-            name,
-            packageType,
-            versions(last: 100) {
-              nodes {
-                version
-              }
-            }
-          }
-        }
-      }
-    }`
-    const {repository: {packages: {nodes: packageNodes}} } = await graphql(packagesQuery, {headers: {authorization: 'token ' + packagePushToken}});
     var existingPackages = [];
-    for (packageNode of packageNodes) {
-        for (versionNode of packageNode.versions.nodes) {
-            console.log('Found existing package version ' + packageNode.name + ' ' + versionNode.version + ' with type ' + packageNode.packageType);
+    
+   const packageNodes = await octokit.rest.packages.listPackagesForOrganization({ "container", thisOwner}); 
+   for (packageNode of packageNodes) {
+        console.log('Got a package: ' + packageNode.name);
+        const packageVersions = await octokit.rest.packages.getAllPackageVersionsForPackageOwnedByOrg("container", packageNode.name, thisOwner);
+        for (versionNode of packageVersions) {
+            console.log('Found existing package version ' + packageNode.name + ' ' + versionNode.metadata.container.tags + ' with type ' + versionNode.metadata.package_type);
             if (packageNode.packageType == 'NUGET') {
                 existingPackages.push(packageNode.name + '.' + versionNode.version + '.nupkg');
-            } else if (packageNode.packageType == 'DOCKER') {
-                existingPackages.push(packageNode.name + '_' + versionNode.version + '.docker.tar.gz');
+            } else if (packageNode.package_type == 'container') {
+                existingPackages.push(packageNode.name + '_' + versionNode.metadata.container.tags + '.docker.tar.gz');
             }
         }
     }
@@ -182,13 +170,21 @@ async function uploadDockerImage(thisOwner, thisRepo, packageName) {
     await exec('grep "Loaded image" docker_load_output | cut -d" " -f 3 > loaded_repotag');
  
     // Artifact name needs to match naming convention. Otherwise we'd have to download artifacts to get the tag to tell if they'd already been uploaded as packages.
+    const tag = await fsp.readFile("loaded_repotag");
+    console.log('Confirming repo/tag in file ' + tag + ' consistent with repo/tag guessed from filename ' + repoTagGuessedFromFileName);
     await exec('echo Confirming repo/tag in file $(cat loaded_repotag) consistent with repo/tag guessed from filename ' + repoTagGuessedFromFileName + ' && [ "$(cat loaded_repotag | rev | cut -d/ -f 1 | rev)" = "' + repoTagGuessedFromFileName + '" ]');
  
     const newTag = (dockerHost + '/' + thisOwner + '/' + thisRepo + '/' + repoTagGuessedFromFileName).toLowerCase();
  
-    await exec('echo Will retag $(cat loaded_repotag) as ' + newTag + ' then push');
-    await exec('docker tag $(cat loaded_repotag) ' + newTag);
-    await exec('docker push ' + newTag);
+    console.log('Will retag ' + tag + ' as ' + newTag + ' then push');
+  
+    const options = {};
+    options.cwd = './lib';
+ 
+    await exec('docker tag $(cat loaded_repotag) ' + newTag + ' > dockerlog.txt 2>&1');
+    await exec('docker push ' + newTag + ' > dockerlog.txt 2>&1');
+    const dockerOutput = await fsp.readFile("dockerlog.txt");
+    console.log("Docker operations output: " + dockerOutput);
 }
  
 (async () => {
