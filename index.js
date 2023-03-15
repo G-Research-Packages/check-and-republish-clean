@@ -4,12 +4,11 @@ const {graphql} = require('@octokit/graphql');
 const fetch = require('node-fetch');
 const fs = require('fs');
 const fsp = require('fs').promises;
-const { Octokit } = require("@octokit/rest");
 const util = require('util');
 const exec = util.promisify(require('child_process').exec);
 const streamPipeline = util.promisify(require('stream').pipeline);
  
-const dockerHost = 'docker.pkg.github.com'
+const dockerHost = 'ghcr.io'
  
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -36,60 +35,7 @@ async function setUpDocker(thisOwner, packagePushUser, packagePushToken) {
     await fsp.writeFile(passwordFilename, packagePushToken);
     await exec('cat ' + passwordFilename + ' | docker login ' + dockerHost + ' --username ' + packagePushUser + ' --password-stdin');
 }
- 
-async function getExistingReleases(thisOwner, thisRepo, packagePushToken) {
-    const releasesQuery = `
-    {
-      repository(owner: "${thisOwner}", name: "${thisRepo}") {
-        releases(first: 100 orderBy: {field: CREATED_AT, direction: DESC}) {
-            nodes {
-                name,
-                tagName
-                } 
-            }
-        }
-    }`
-    
-    const {repository: {releases: {nodes: releaseNodes}} } = await graphql(releasesQuery, {headers: {authorization: 'token ' + packagePushToken}});
-    var existingReleases = [];
-    for (releaseNode of releaseNodes) {
-        console.log('Found existing release with name ' + releaseNode.name + ' and tag ' + releaseNode.tagName);
-        existingReleases.push(releaseNode.name + '_' + releaseNode.tagName);
-    }
- 
-    return existingReleases;
-}
- 
-async function getExistingPackages(thisOwner, thisRepo, packagePushToken) {
-    var existingPackages = [];
-    
-   const packageNodes = await octokit.rest.packages.listPackagesForOrganization({ "container", thisOwner}); 
-   for (packageNode of packageNodes) {
-        console.log('Got a package: ' + packageNode.name);
-        const packageVersions = await octokit.rest.packages.getAllPackageVersionsForPackageOwnedByOrg("container", packageNode.name, thisOwner);
-        for (versionNode of packageVersions) {
-            console.log('Found existing package version ' + packageNode.name + ' ' + versionNode.metadata.container.tags + ' with type ' + versionNode.metadata.package_type);
-            if (packageNode.packageType == 'NUGET') {
-                existingPackages.push(packageNode.name + '.' + versionNode.version + '.nupkg');
-            } else if (packageNode.package_type == 'container') {
-                existingPackages.push(packageNode.name + '_' + versionNode.metadata.container.tags + '.docker.tar.gz');
-            }
-        }
-    }
-    return existingPackages;
-}
 
-function packageNameToReleaseAndTagName(packageName)
-{
-    const nameParts = packageName.split('_');
- 
-    if (nameParts.length != 3) {
-        core.setFailed('Package name should be in the format <release name>_<tag>_[.extension]: Found ' + packageName);
-                return '';
-            }
-    return nameParts[0] + '_' + nameParts[1];
-}
- 
 async function uploadNugetPackage(thisOwner, thisRepo, packageName) {
     console.log('- Unpacking NuGet package');
     const extractedDir = packageName + '.extracted';
@@ -122,54 +68,14 @@ async function uploadNugetPackage(thisOwner, thisRepo, packageName) {
     console.log('- Uploaded ' + packageName);
 }
  
-async function uploadAsRelease(thisOwner, thisRepo, packageName, octokit) {
-    const nameParts = packageName.split('_');
- 
-    if (nameParts.length != 3) {
-        core.setFailed('Package name should be in the format <release name>_<tag>_[.extension]: Found ' + packageName);
-                return;
-            }
-    
-    const releaseName = nameParts[0];
-    const releaseTag = nameParts[1];
-    console.log('- Release name extracted from filename: ' + releaseName);
-    console.log('- Release tag extracted from filename: ' + releaseTag);
- 
-    const {data: {id: id, upload_url: uploadUrl}} = await octokit.request('POST /repos/{owner}/{repo}/releases', {
-        owner: thisOwner,
-        repo: thisRepo,
-        tag_name: releaseTag,
-        target_commitish: 'main',
-        name: releaseName,
-        body: 'Uploaded by HI build process',
-        draft: false,
-        prerelease: false,
-        generate_release_notes: false
-      })
-
-      const size = fs.statSync(packageName).size;
- 
-      await octokit.request({
-        name: releaseName,
-        label: packageName,
-        data: fs.createReadStream(packageName),
-        method: "POST",
-        url: uploadUrl,
-        headers: {
-            "content-type": "text/json",
-            "content-length": size
-        }
-      })
-}
-
 async function uploadDockerImage(thisOwner, thisRepo, packageName) {
     console.log('- Uploading docker image from ' + packageName);
  
-    const repoTagGuessedFromFileName = packageName.replace('.docker.tar.gz', '').replace('_', ':');
     await exec('zcat ' + packageName + ' | docker load > docker_load_output');
     await exec('grep "Loaded image" docker_load_output | cut -d" " -f 3 > loaded_repotag');
  
     // Artifact name needs to match naming convention. Otherwise we'd have to download artifacts to get the tag to tell if they'd already been uploaded as packages.
+    const repoTagGuessedFromFileName = packageName.replace('.docker.tar.gz', '').replace('_', ':');
     const tag = await fsp.readFile("loaded_repotag");
     console.log('Confirming repo/tag in file ' + tag + ' consistent with repo/tag guessed from filename ' + repoTagGuessedFromFileName);
     await exec('echo Confirming repo/tag in file $(cat loaded_repotag) consistent with repo/tag guessed from filename ' + repoTagGuessedFromFileName + ' && [ "$(cat loaded_repotag | rev | cut -d/ -f 1 | rev)" = "' + repoTagGuessedFromFileName + '" ]');
@@ -186,6 +92,52 @@ async function uploadDockerImage(thisOwner, thisRepo, packageName) {
     const dockerOutput = await fsp.readFile("dockerlog.txt");
     console.log("Docker operations output: " + dockerOutput);
 }
+
+async function dockerImageShouldBePublished(thisOwner, thisRepo, packageName, octokit)
+{
+    // Name has to follow a precise format so we can tag it correctly.
+    const nameParts = packageName.replace('.docker.tar.gz', '').split('_');
+    if (nameParts.length != 2){
+        core.setFailed('Docker package filenames must be in the format <package name>_<tag>.docker.tar.gz. Found ' + packageName);
+        return false;
+    }
+
+    // What's the build process wanting to publish?
+    const packageNameGuessedFromFilename = nameParts[0];
+    const publishedTag = nameParts[1];
+
+    // We need to pull all tags for all versions of this package from github container registry.
+    // We do this via the rest API; the inclusion of the URI-encoded repo name seems to be a weird
+    // throwback/side effect from github's move from repo level packages to the dedicated ghcr.io docker registry
+    const versionPath = 'https://api.github.com/orgs/' + thisOwner + '/packages/container/' + encodeURIComponent(thisRepo + '/' + packageNameGuessedFromFilename) + '/versions';
+    try{
+        const {data: packageVersions} = await octokit.request(versionPath);
+        // Squash the response data into a list of tags for the container. 
+        const tags = packageVersions.flatMap(item => item.metadata.container.tags.flatMap(item => item));
+        
+        // We've got the tags from ghcr. Do any of the match what we want to publish?
+        const matchedTag = tags.find(tag => tag == publishedTag);
+        if (matchedTag) {
+            console.log('Tag ' + publishedTag + ' of ' + packageNameGuessedFromFilename + ' already present in package registry. Skipping.');
+            return false;
+        }
+        else {
+            console.log('Tag ' + publishedTag + ' of ' + packageNameGuessedFromFilename + ' not found in package registry. It will be pushed to the registry.');
+            return true;
+        }
+    }
+    catch (e) {
+        if (e.status == 404){
+            console.log('Package ' + packageNameGuessedFromFilename + ' not found in package registry. It will be pushed to the registry.');
+            return true;
+        }
+        else{
+            console.log(e);
+            throw(e);
+        }
+    }
+}
+
  
 (async () => {
     try {
@@ -196,17 +148,13 @@ async function uploadDockerImage(thisOwner, thisRepo, packageName) {
         const packagePushToken = core.getInput('package-push-token');
         const thisOwner = process.env['GITHUB_REPOSITORY'].split('/')[0];
         const thisRepo = process.env['GITHUB_REPOSITORY'].split('/')[1];
-        const publishAsRelease = core.getInput('publish-as-release') == 'true';
         const octokit = github.getOctokit(sourceToken);
  
-        console.log('Starting with parameters sourceOwner=' + sourceOwner + ' packagePushUser=' + packagePushUser + ' thisOwner/thisRepo=' + thisOwner + '/' + thisRepo + ' publishAsRelease=' + publishAsRelease)
+        console.log('Starting with parameters sourceOwner=' + sourceOwner + ' packagePushUser=' + packagePushUser + ' thisOwner/thisRepo=' + thisOwner + '/' + thisRepo)
  
         await setUpNuget(thisOwner, packagePushUser, packagePushToken);
         await setUpDocker(thisOwner, packagePushUser, packagePushToken);
  
-        const existingPackages = await getExistingPackages(thisOwner, thisRepo, packagePushToken);
-        const existingReleases = await getExistingReleases(thisOwner, thisRepo, packagePushToken);
-        
         var thresholdDate = new Date();
         thresholdDate.setHours(thresholdDate.getHours() - 12);
  
@@ -236,6 +184,7 @@ async function uploadDockerImage(thisOwner, thisRepo, packageName) {
             console.log('Found ' + workflowRuns.length + ' workflow run(s) in total. Of these, ' + recentWorkflowRuns.length + ' were updated after ' + thresholdDate.toISOString() + ', the rest will be ignored.');
  
             for (workflowRun of recentWorkflowRuns) {
+                const rn = workflowRun.run_number;
                 console.log('Checking workflow run number ' + workflowRun.run_number + ' (url ' + workflowRun.html_url + ',  updated at ' + workflowRun.updated_at + ')');
                 const {data: {artifacts: artifacts}} = await octokit.actions.listWorkflowRunArtifacts({owner: sourceOwner, repo: sourceRepo, run_id: workflowRun.id});
                 const {data: {jobs}} = await octokit.actions.listJobsForWorkflowRun({owner: sourceOwner, repo: sourceRepo, run_id: workflowRun.id});
@@ -255,6 +204,7 @@ async function uploadDockerImage(thisOwner, thisRepo, packageName) {
                             const package = {name: match[1], sha: match[2]}
                             if (!packagesPublishedByJob.find(p => p.name == package.name)) {
                                 packagesPublishedByJob.push(package);
+                                console.log('Build has published a package named ' + package.name)
                             }
                         }
                     }
@@ -262,12 +212,24 @@ async function uploadDockerImage(thisOwner, thisRepo, packageName) {
                  
                     
                     for (package of packagesPublishedByJob) {
-                        if (publishAsRelease && existingReleases.includes(packageNameToReleaseAndTagName(package.name)) ||
-                            !publishAsRelease && existingPackages.includes(package.name)) {
-                            console.log(package.name + ' [' + package.sha + ']: Already republished');
+                        // See if we can find this package in the repository. We used to be able to do this with one nice
+                        // GraphQL query that grabbed all packages in the org/repo, but GitHub have changed the whole way
+                        // packages work, and some of our packages don't get returned. Not sure why. Not worth debugging.
+                        // Instead we'll just search for the packages as we process them.
+
+                        // Do we support this package type?
+                        if (package.name.endsWith('.nupkg')) {
+                            core.setFailed('Nuget support has been dropped - not believed to be in use. Ping Duncan Millard if you need it.');
+                        } else if (package.name.endsWith('.docker.tar.gz')) {
+                            if (!(await dockerImageShouldBePublished(thisOwner, thisRepo, package.name, octokit))) {
+                                continue;
+                            }
+                        } else {
+                            core.setFailed('Package type for ' + package.name + ' not currently supported');
                             continue;
                         }
- 
+
+                        // We're okay to proceed. Grab the artifact, pass it to the uploader.
                         const artifact = artifacts.find(artifact => artifact.name == package.name);
                         if (!artifact) {
                             core.setFailed(package.name + '[' + package.sha + ']: No artifact with that name uploaded by workflow run');
@@ -291,16 +253,16 @@ async function uploadDockerImage(thisOwner, thisRepo, packageName) {
                         console.log('Confirming sha256');
                         const {stdout} = await exec('sha256sum ' + package.name);
                         const sha256 = stdout.slice(0, 64);
+
                         if (package.sha != sha256) {
                             core.setFailed(package.name + '[' + package.sha + ']: Found artifact with non-matching SHA256 ' + sha256);
                             continue;
                         }
                         
                         console.log(package.name + ' [' + package.sha + ']: Downloaded artifact, SHA256 matches, republishing:');
-                        if (publishAsRelease) {
-                            await uploadAsRelease(thisOwner, thisRepo, package.name, octokit);
-                        } else if (package.name.endsWith('.nupkg')) {
-                            await uploadNugetPackage(thisOwner, thisRepo, package.name);
+                        if (package.name.endsWith('.nupkg')) {
+                            // await uploadNugetPackage(thisOwner, thisRepo, package.name);
+                            core.setFailed('Nuget support has been dropped - not believed to be in use. Ping Duncan Millard if you need it.');
                         } else if (package.name.endsWith('.docker.tar.gz')) {
                             await uploadDockerImage(thisOwner, thisRepo, package.name);
                         } else {
