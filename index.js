@@ -184,93 +184,106 @@ async function dockerImageShouldBePublished(thisOwner, thisRepo, packageName, oc
             console.log('Found ' + workflowRuns.length + ' workflow run(s) in total. Of these, ' + recentWorkflowRuns.length + ' were updated after ' + thresholdDate.toISOString() + ', the rest will be ignored.');
  
             for (workflowRun of recentWorkflowRuns) {
-                const rn = workflowRun.run_number;
-                console.log('Checking workflow run number ' + workflowRun.run_number + ' (url ' + workflowRun.html_url + ',  updated at ' + workflowRun.updated_at + ')');
-                const {data: {artifacts: artifacts}} = await octokit.actions.listWorkflowRunArtifacts({owner: sourceOwner, repo: sourceRepo, run_id: workflowRun.id});
-                const {data: {jobs}} = await octokit.actions.listJobsForWorkflowRun({owner: sourceOwner, repo: sourceRepo, run_id: workflowRun.id});
-                for (job of jobs) {
-                    if (job.status != 'completed') {
-                        console.log(job.name + ': ' + job.status);
-                        continue;
-                    }
-                    
-                    const {data: log} = await octokit.actions.downloadJobLogsForWorkflowRun({owner: sourceOwner, repo: sourceRepo, job_id: job.id});
-                    const logLines = log.split(/\r?\n/)
- 
-                    var packagesPublishedByJob = [];
-                    for (logLine of logLines) {
-                        const match = logLine.match(/--- Uploaded package ([^ ]+) as a GitHub artifact \(SHA256: ([^ ]+)\) ---/)
-                        if (match != null) {
-                            const package = {name: match[1], sha: match[2]}
-                            if (!packagesPublishedByJob.find(p => p.name == package.name)) {
-                                packagesPublishedByJob.push(package);
-                                console.log('Build has published a package named ' + package.name)
-                            }
-                        }
-                    }
-                    console.log(job.name + ': ' + job.status + ', published ' + packagesPublishedByJob.length + ' package(s):');
-                 
-                    
-                    for (package of packagesPublishedByJob) {
-                        // See if we can find this package in the repository. We used to be able to do this with one nice
-                        // GraphQL query that grabbed all packages in the org/repo, but GitHub have changed the whole way
-                        // packages work, and some of our packages don't get returned. Not sure why. Not worth debugging.
-                        // Instead we'll just search for the packages as we process them.
-
-                        // Do we support this package type?
-                        if (package.name.endsWith('.nupkg')) {
-                            core.setFailed('Nuget support has been dropped - not believed to be in use. Ping Duncan Millard if you need it.');
-                        } else if (package.name.endsWith('.docker.tar.gz')) {
-                            if (!(await dockerImageShouldBePublished(thisOwner, thisRepo, package.name, octokit))) {
-                                continue;
-                            }
-                        } else {
-                            core.setFailed('Package type for ' + package.name + ' not currently supported');
-                            continue;
-                        }
-
-                        // We're okay to proceed. Grab the artifact, pass it to the uploader.
-                        const artifact = artifacts.find(artifact => artifact.name == package.name);
-                        if (!artifact) {
-                            core.setFailed(package.name + '[' + package.sha + ']: No artifact with that name uploaded by workflow run');
-                            continue;
-                        }
- 
-                        console.log('Resolving download URL for artifact ' + artifact.id + ' from ' + sourceOwner + '/' + sourceRepo);
-                        const { headers: { location: artifactDownloadUrl } } = await octokit.request(artifact.url + '/zip', { request: { redirect: 'manual' } });
- 
-                        console.log('Downloading artifact ' + artifact.id + ' from ' + sourceOwner + '/' + sourceRepo);
-                        const downloadResponse = await fetch(artifactDownloadUrl);
-                        if (!downloadResponse.ok) {
-                            core.setFailed('Unable to download artifact ' + artifact.id + ' from ' + sourceOwner + '/' + sourceRepo + ': Unexpected response ' + downloadResponse.statusText);
-                            continue;
-                        }
-                        await streamPipeline(downloadResponse.body, fs.createWriteStream(package.name + '.zip'));
- 
-                        console.log('Unzipping');
-                        await exec('unzip -o ' + package.name + '.zip && rm -f ' + package.name + '.zip');
- 
-                        console.log('Confirming sha256');
-                        const {stdout} = await exec('sha256sum ' + package.name);
-                        const sha256 = stdout.slice(0, 64);
-
-                        if (package.sha != sha256) {
-                            core.setFailed(package.name + '[' + package.sha + ']: Found artifact with non-matching SHA256 ' + sha256);
+                // Treat each workflow run individually and continue if any one of the checks fails.
+                // Added because GitHub seems to change the "last updated" on old workflow runs to make them look recent. We then try and pull the logs
+                // but they've been archived, which causes this check to fail.
+                // Working theory is that the update to the seemingly unexpected change in the last updated date on the workflow is in fact related to the archival of logs taking place.
+                try{
+                
+                    const rn = workflowRun.run_number;
+                    console.log('Checking workflow run number ' + workflowRun.run_number + ' (url ' + workflowRun.html_url + ',  updated at ' + workflowRun.updated_at + ')');
+                
+                    const {data: {artifacts: artifacts}} = await octokit.actions.listWorkflowRunArtifacts({owner: sourceOwner, repo: sourceRepo, run_id: workflowRun.id});
+                    const {data: {jobs}} = await octokit.actions.listJobsForWorkflowRun({owner: sourceOwner, repo: sourceRepo, run_id: workflowRun.id});
+                    for (job of jobs) {
+                        if (job.status != 'completed') {
+                            console.log(job.name + ': ' + job.status);
                             continue;
                         }
                         
-                        console.log(package.name + ' [' + package.sha + ']: Downloaded artifact, SHA256 matches, republishing:');
-                        if (package.name.endsWith('.nupkg')) {
-                            // await uploadNugetPackage(thisOwner, thisRepo, package.name);
-                            core.setFailed('Nuget support has been dropped - not believed to be in use. Ping Duncan Millard if you need it.');
-                        } else if (package.name.endsWith('.docker.tar.gz')) {
-                            await uploadDockerImage(thisOwner, thisRepo, package.name);
-                        } else {
-                            core.setFailed('Package type not currently supported');
+                        const {data: log} = await octokit.actions.downloadJobLogsForWorkflowRun({owner: sourceOwner, repo: sourceRepo, job_id: job.id});
+                        const logLines = log.split(/\r?\n/)
+    
+                        var packagesPublishedByJob = [];
+                        for (logLine of logLines) {
+                            const match = logLine.match(/--- Uploaded package ([^ ]+) as a GitHub artifact \(SHA256: ([^ ]+)\) ---/)
+                            if (match != null) {
+                                const package = {name: match[1], sha: match[2]}
+                                if (!packagesPublishedByJob.find(p => p.name == package.name)) {
+                                    packagesPublishedByJob.push(package);
+                                    console.log('Build has published a package named ' + package.name)
+                                }
+                            }
+                        }
+                        console.log(job.name + ': ' + job.status + ', published ' + packagesPublishedByJob.length + ' package(s):');
+                    
+                        
+                        for (package of packagesPublishedByJob) {
+                            // See if we can find this package in the repository. We used to be able to do this with one nice
+                            // GraphQL query that grabbed all packages in the org/repo, but GitHub have changed the whole way
+                            // packages work, and some of our packages don't get returned. Not sure why. Not worth debugging.
+                            // Instead we'll just search for the packages as we process them.
+
+                            // Do we support this package type?
+                            if (package.name.endsWith('.nupkg')) {
+                                core.setFailed('Nuget support has been dropped - not believed to be in use. Ping Duncan Millard if you need it.');
+                            } else if (package.name.endsWith('.docker.tar.gz')) {
+                                if (!(await dockerImageShouldBePublished(thisOwner, thisRepo, package.name, octokit))) {
+                                    continue;
+                                }
+                            } else {
+                                core.setFailed('Package type for ' + package.name + ' not currently supported');
+                                continue;
+                            }
+
+                            // We're okay to proceed. Grab the artifact, pass it to the uploader.
+                            const artifact = artifacts.find(artifact => artifact.name == package.name);
+                            if (!artifact) {
+                                core.setFailed(package.name + '[' + package.sha + ']: No artifact with that name uploaded by workflow run');
+                                continue;
+                            }
+    
+                            console.log('Resolving download URL for artifact ' + artifact.id + ' from ' + sourceOwner + '/' + sourceRepo);
+                            const { headers: { location: artifactDownloadUrl } } = await octokit.request(artifact.url + '/zip', { request: { redirect: 'manual' } });
+    
+                            console.log('Downloading artifact ' + artifact.id + ' from ' + sourceOwner + '/' + sourceRepo);
+                            const downloadResponse = await fetch(artifactDownloadUrl);
+                            if (!downloadResponse.ok) {
+                                core.setFailed('Unable to download artifact ' + artifact.id + ' from ' + sourceOwner + '/' + sourceRepo + ': Unexpected response ' + downloadResponse.statusText);
+                                continue;
+                            }
+                            await streamPipeline(downloadResponse.body, fs.createWriteStream(package.name + '.zip'));
+    
+                            console.log('Unzipping');
+                            await exec('unzip -o ' + package.name + '.zip && rm -f ' + package.name + '.zip');
+    
+                            console.log('Confirming sha256');
+                            const {stdout} = await exec('sha256sum ' + package.name);
+                            const sha256 = stdout.slice(0, 64);
+
+                            if (package.sha != sha256) {
+                                core.setFailed(package.name + '[' + package.sha + ']: Found artifact with non-matching SHA256 ' + sha256);
+                                continue;
+                            }
+                            
+                            console.log(package.name + ' [' + package.sha + ']: Downloaded artifact, SHA256 matches, republishing:');
+                            if (package.name.endsWith('.nupkg')) {
+                                // await uploadNugetPackage(thisOwner, thisRepo, package.name);
+                                core.setFailed('Nuget support has been dropped - not believed to be in use. Ping Duncan Millard if you need it.');
+                            } else if (package.name.endsWith('.docker.tar.gz')) {
+                                await uploadDockerImage(thisOwner, thisRepo, package.name);
+                            } else {
+                                core.setFailed('Package type not currently supported');
+                            }
                         }
                     }
                 }
+                catch (e) {
+                    console.log('Error checking workflow run number ' + workflowRun.run_number + ' (url ' + workflowRun.html_url + ',  updated at ' + workflowRun.updated_at + ')');
+                    core.setFailed(e.message);
+                }
             }
+            
         }
     } catch (error) {
         core.setFailed(error.message);
