@@ -279,8 +279,8 @@ async function dockerImageShouldBePublished(thisOwner, thisRepo, packageName, oc
                     }
                 }
                 catch (e) {
-                    console.log('Error checking workflow run number ' + workflowRun.run_number + ' (url ' + workflowRun.html_url + ',  updated at ' + workflowRun.updated_at + ')');
-                    core.setFailed(e.message);
+                    console.log('Error. Package not published. Checking workflow run number ' + workflowRun.run_number + ' (url ' + workflowRun.html_url + ',  updated at ' + workflowRun.updated_at + ')');
+                    console.log(e);
                 }
             }
             
